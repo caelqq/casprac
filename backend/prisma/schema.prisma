@@ -1,0 +1,240 @@
+// backend/prisma/schema.prisma
+
+// This file defines our database structure using Prisma's schema language.
+// NOTE: As of Prisma 7, the database connection URL does NOT go here
+// anymore — it lives in prisma.config.ts instead. This file only
+// describes *what* the database looks like, not *how* to connect to it.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// The User model represents a single row in the "users" table.
+// Every registered player and admin account will be a row here.
+model User {
+  // Unique identifier for each user. We use a UUID instead of a simple
+  // auto-incrementing number (1, 2, 3...) so that user IDs can't be
+  // guessed or enumerated by an attacker trying to scrape user data
+  // (e.g. by requesting /api/users/1, /api/users/2, etc).
+  id String @id @default(uuid())
+
+  // Login credentials
+  username     String @unique
+  email        String @unique
+  passwordHash String // Never store plain text passwords — only a bcrypt/argon2 hash goes here.
+
+  // Access control: "user" (self-registered) or "admin" (manually inserted
+  // into the database only — never created through the Register form).
+  role String @default("user")
+
+  // Anti-abuse: used later to enforce "max 3 accounts per IP" at registration.
+  // Nullable because we may not always be able to capture it reliably.
+  registrationIp String?
+
+  createdAt DateTime @default(now())
+
+  // --- Brute-force lockout system fields ---
+
+  // Counts consecutive failed login attempts for THIS account.
+  // Resets to 0 on any successful login.
+  failedLoginAttempts Int @default(0)
+
+  // If set to a future date/time, the account is locked out until then.
+  // Null means the account is not currently locked out.
+  lockoutUntil DateTime?
+
+  // Tracks whether this account has ever been locked out before.
+  // First lockout cycle allows 15 tries; every cycle after that only
+  // allows 5 tries before the next lockout.
+  hasBeenLockedOutBefore Boolean @default(false)
+
+  // --- Leveling system (placeholder for now) ---
+
+  // Every user starts at level 1. This will eventually rise from actual
+  // gameplay (once games exist), but for now it just sits at the default.
+  // Used to gate access to the Highrollers chat room (level 10+ only).
+  level Int @default(1)
+
+  // --- Profile picture ---
+
+  // Path/URL to the user's uploaded avatar image, e.g.
+  // "/uploads/avatars/<uuid>.jpg". Nullable — a user who has never
+  // uploaded a photo simply has no row value here, and the frontend
+  // falls back to showing their initial letter instead (same as today).
+  // We store a STRING PATH, never the raw image bytes, in the database —
+  // the actual image file lives on disk (or later, cloud storage), and
+  // this column just points to it.
+  avatarUrl String?
+
+  // --- Email change cooldown ---
+
+  // Timestamp of the last time this user's email was successfully
+  // changed. Null means they have NEVER changed it (so no cooldown
+  // applies — they're free to change it right away). Every time a
+  // change succeeds, the backend sets this to "now." Before allowing a
+  // NEW change, the backend checks: is (now - lastEmailChangeAt) at
+  // least 7 days? If not, the request is rejected with a clear message
+  // saying how much longer they need to wait.
+  //
+  // This MUST be enforced server-side (which is what we're building in
+  // Step 2) — a client-side-only cooldown could trivially be bypassed
+  // by anyone calling the API directly instead of clicking the button.
+  lastEmailChangeAt DateTime?
+
+  // --- Wallet balance ---
+
+  // The user's spendable balance, stored as a whole number of CENTS
+  // (never dollars-as-a-decimal). $10,000.00 is stored as 1000000.
+  // Storing money as an integer of the smallest unit avoids floating-
+  // point rounding errors that can silently creep in with decimal
+  // arithmetic over many additions/subtractions. Every deposit,
+  // withdrawal, or tip will add/subtract whole cents from this field —
+  // never a fraction of a cent. The frontend divides by 100 and formats
+  // as dollars only for display.
+  balanceCents Int @default(0)
+
+  // One user can send many chat messages. This is the "back-reference"
+  // side of the relation — it doesn't create a column here, it just lets
+  // Prisma know a user can have many ChatMessages attached to them.
+  chatMessages ChatMessage[]
+
+  // One user can play many rounds of Mines over time. Same "back-
+  // reference" pattern as chatMessages above — no column added here,
+  // just lets Prisma know about the relation for queries like "give me
+  // this user's mines history."
+  minesRounds MinesRound[]
+}
+
+// One row per chat message sent in any of the public chat rooms.
+model ChatMessage {
+  // Unique identifier for each message, same UUID reasoning as User.id.
+  id String @id @default(uuid())
+
+  // Which chat room this message belongs to. Plain string for now since
+  // all 4 rooms behave identically — "english" | "filipino" | "indonesian"
+  // | "highrollers". Kept as a string (not a fixed enum) so we can add or
+  // rename rooms later without a schema migration.
+  room String
+
+  // Who sent it. Linked to the User table so we can always look up the
+  // real, authenticated sender — never trust a username typed by the client.
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  // The actual message text.
+  content String
+
+  // When the message was sent. Used for the timestamp shown next to each
+  // message in the chat UI.
+  createdAt DateTime @default(now())
+
+  // --- Reply feature (relational — Option B) ---
+  //
+  // If this message is a reply to another message, replyToMessageId
+  // points at that original message's id. We store a REFERENCE, not a
+  // copy of its text — the server always re-fetches the real content
+  // from the database when building a response, so a user can never
+  // fake what the "original" message said.
+  //
+  // onDelete: SetNull means if the original message is ever deleted in
+  // the future (no delete feature exists yet, but this future-proofs
+  // it), replies to it simply lose the reference instead of crashing
+  // or cascading into deleting the reply itself.
+  replyToMessageId String?
+  replyToMessage   ChatMessage?  @relation("MessageReplies", fields: [replyToMessageId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  // The other side of the same self-relation: all the messages that
+  // reply TO this one. Doesn't create a column — just lets Prisma know
+  // about the reverse direction of the relation.
+  replies ChatMessage[] @relation("MessageReplies")
+
+  // Speeds up the most common query we'll run: "give me the last N
+  // messages for room X, ordered by time" — without this, Postgres would
+  // have to scan the entire table every time someone opens a chat room.
+  @@index([room, createdAt])
+
+  // Speeds up looking up a message by its replyToMessageId (used when
+  // Prisma joins in the quoted-reply data for every message in history).
+  @@index([replyToMessageId])
+}
+
+// One row per Mines round — created the instant a player clicks Start,
+// and updated as they reveal tiles, until the round ends (win, loss, or
+// cash out).
+//
+// SECURITY NOTE — this is the most important model in the whole game:
+// minePositions is the array of hidden mine tile indices. It lives ONLY
+// in this database row while the round is "active" — it is NEVER sent
+// to the frontend until after the round ends (lost or cashed_out), at
+// which point revealing it is harmless because the round is already
+// over. This is what makes it impossible for a player to inspect their
+// browser's network tab or JavaScript state and see where the mines are
+// before clicking.
+model MinesRound {
+  // Unique identifier for this round, same UUID reasoning as everywhere
+  // else. The frontend refers to an in-progress round by this id on
+  // every "reveal a tile" or "cash out" request — never by anything the
+  // client could forge (like an array index).
+  id String @id @default(uuid())
+
+  // Who's playing. ALWAYS taken from the caller's verified JWT cookie
+  // server-side when the round is created — never trusted from the
+  // request body. This is what stops a user from ever revealing tiles
+  // or cashing out someone else's round.
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  // How much was wagered, in cents — same "always cents, never a
+  // decimal dollar amount" rule as balanceCents and tipping. This is
+  // deducted from the player's balance atomically the moment the round
+  // is created (same updateMany + gte pattern used for tipping), so a
+  // round can never exist that wasn't actually paid for.
+  betCents Int
+
+  // Total number of tiles on the board for THIS round (16 for 4x4, 25
+  // for 5x5, up to 64 for 8x8). Stored per-round (not just derived from
+  // a "gridSize" setting elsewhere) so that old rounds still make sense
+  // even if we ever add new grid sizes later — each round is a frozen
+  // snapshot of the settings it was played with.
+  totalTiles Int
+
+  // How many mines were hidden in this round.
+  minesCount Int
+
+  // The hidden mine tile indices (0-based, e.g. 0-24 for a 5x5 board).
+  // THIS IS THE SECRET — see the model-level note above. Only ever read
+  // by backend code; only ever sent to the frontend after the round is
+  // no longer "active".
+  minePositions Int[]
+
+  // Which tile indices the player has successfully revealed as safe so
+  // far, in order. Starts empty the moment the round is created.
+  revealedTiles Int[] @default([])
+
+  // Current state of the round:
+  // "active"     — round is in progress, player can still reveal tiles or cash out
+  // "cashed_out" — player manually cashed out and was paid
+  // "lost"       — player revealed a mine tile; round is over, no payout
+  status String @default("active")
+
+  // The current multiplier based on how many safe tiles have been
+  // revealed so far. Starts at 1.0 the moment the round is created.
+  // Recalculated by the backend (never trusted from the client) every
+  // time a safe tile is revealed, using the probability formula:
+  // fairMultiplier = C(totalTiles, n) / C(totalTiles - minesCount, n),
+  // then reduced by the house edge.
+  currentMultiplier Float @default(1.0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Speeds up "does this user have an active round right now" checks —
+  // useful later if we want to stop a player from starting a second
+  // round while one is already in progress.
+  @@index([userId, status])
+}
